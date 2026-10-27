@@ -1,0 +1,273 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root { color-scheme: light dark; }
+  body { margin: 0; padding: 12px; font: 12px/1.45 Inter, -apple-system, "Segoe UI", sans-serif; color: var(--figma-color-text, #222); background: var(--figma-color-bg, #fff); }
+  .row { display: flex; gap: 6px; align-items: center; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #bbb; flex: none; }
+  .dot.on { background: #14ae5c; } .dot.wait { background: #f5a623; } .dot.err { background: #f24822; }
+  #state { font-weight: 600; }
+  input { flex: 1; min-width: 0; padding: 5px 7px; border: 1px solid var(--figma-color-border, #ccc); border-radius: 4px; background: transparent; color: inherit; font: inherit; }
+  button { padding: 5px 10px; border: 0; border-radius: 4px; background: var(--figma-color-bg-brand, #0d99ff); color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+  button.secondary { background: var(--figma-color-bg-secondary, #eee); color: inherit; }
+  .muted { color: var(--figma-color-text-secondary, #777); }
+  #log { margin-top: 8px; height: 92px; overflow: auto; border-top: 1px solid var(--figma-color-border, #e5e5e5); padding-top: 6px; font: 11px/1.4 ui-monospace, Consolas, monospace; }
+  #log div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .ok { color: #14ae5c; } .bad { color: #f24822; }
+</style>
+</head>
+<body>
+  <div class="row"><span id="dot" class="dot"></span><span id="state">Starting…</span></div>
+  <div class="muted" id="detail" style="margin:4px 0 8px">Relay: <span id="relay"></span></div>
+  <div class="row">
+    <input id="token" type="password" placeholder="Paste the token (figma-bridge token --show)" autocomplete="off" spellcheck="false">
+    <button id="connect">Connect</button>
+  </div>
+  <div class="row" style="margin-top:6px">
+    <span class="muted" id="counts">0 jobs</span>
+    <span style="flex:1"></span>
+    <button class="secondary" id="toggle">Pause</button>
+  </div>
+  <div id="log"></div>
+<script>
+  // Must match devAllowedDomains in manifest.json (Figma accepts host names there, not IP addresses).
+  const RELAY = 'http://localhost:3789';
+  const MAX_BODY_BYTES = 60 * 1024 * 1024;   // the relay accepts 64 MB per request
+
+  // --- crypto start --- (SHA-256 / HMAC-SHA256; plain JS so it works without crypto.subtle)
+  const K = new Uint32Array([
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2]);
+  function sha256(msg) {
+    const len = msg.length, total = Math.ceil((len + 9) / 64) * 64;
+    const buf = new Uint8Array(total);
+    buf.set(msg); buf[len] = 0x80;
+    const dv = new DataView(buf.buffer);
+    dv.setUint32(total - 8, Math.floor(len / 0x20000000));
+    dv.setUint32(total - 4, (len << 3) >>> 0);
+    const H = new Uint32Array([0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]);
+    const W = new Uint32Array(64);
+    for (let off = 0; off < total; off += 64) {
+      for (let i = 0; i < 16; i++) W[i] = dv.getUint32(off + i * 4);
+      for (let i = 16; i < 64; i++) {
+        const a = W[i - 15], b = W[i - 2];
+        const s0 = ((a >>> 7) | (a << 25)) ^ ((a >>> 18) | (a << 14)) ^ (a >>> 3);
+        const s1 = ((b >>> 17) | (b << 15)) ^ ((b >>> 19) | (b << 13)) ^ (b >>> 10);
+        W[i] = (W[i - 16] + s0 + W[i - 7] + s1) | 0;
+      }
+      let a = H[0], b = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
+      for (let i = 0; i < 64; i++) {
+        const S1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
+        const t1 = (h + S1 + ((e & f) ^ (~e & g)) + K[i] + W[i]) | 0;
+        const S0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
+        const t2 = (S0 + ((a & b) ^ (a & c) ^ (b & c))) | 0;
+        h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+      }
+      H[0] += a; H[1] += b; H[2] += c; H[3] += d; H[4] += e; H[5] += f; H[6] += g; H[7] += h;
+    }
+    const out = new Uint8Array(32), odv = new DataView(out.buffer);
+    for (let i = 0; i < 8; i++) odv.setUint32(i * 4, H[i]);
+    return out;
+  }
+  function hmacSha256(key, msg) {
+    if (key.length > 64) key = sha256(key);
+    const k = new Uint8Array(64); k.set(key);
+    const inner = new Uint8Array(64 + msg.length), outer = new Uint8Array(96);
+    for (let i = 0; i < 64; i++) { inner[i] = k[i] ^ 0x36; outer[i] = k[i] ^ 0x5c; }
+    inner.set(msg, 64);
+    outer.set(sha256(inner), 64);
+    return sha256(outer);
+  }
+  const utf8 = new TextEncoder();
+  function hex(bytes) { let s = ''; for (const b of bytes) s += (b < 16 ? '0' : '') + b.toString(16); return s; }
+  function randomHex(n) { return hex(crypto.getRandomValues(new Uint8Array(n))); }
+  function concatBytes(a, b) { const out = new Uint8Array(a.length + b.length); out.set(a); out.set(b, a.length); return out; }
+  // --- crypto end ---
+
+  const SESSION = randomHex(16);   // one per plugin launch; the relay serves the latest session to say hello
+  let token = '';
+  let paused = false;
+  let generation = 0;              // bumps on connect/pause so an old loop stops after its current request
+  let mainBusy = 0;                // jobs handed to the main thread that have not answered yet
+  let jobs = 0, failures = 0;
+  const pending = new Map();       // job id -> resolve
+
+  const $ = id => document.getElementById(id);
+  function setState(kind, text) { $('dot').className = 'dot ' + kind; $('state').textContent = text; }
+  function log(text, cls) {
+    const d = document.createElement('div');
+    d.textContent = new Date().toLocaleTimeString() + '  ' + text;
+    if (cls) d.className = cls;
+    $('log').prepend(d);
+    while ($('log').childNodes.length > 60) $('log').lastChild.remove();
+  }
+  function counts() { $('counts').textContent = jobs + ' job' + (jobs === 1 ? '' : 's') + (failures ? ', ' + failures + ' failed' : ''); }
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  // Signed request (the MAC covers method, path, session and body); the response counts only if the relay
+  // proves it knows the token (`verified`).
+  async function call(method, path, body, timeoutMs, ctrl) {
+    const ts = String(Date.now()), nonce = randomHex(16);
+    const key = utf8.encode(token);
+    let bytes = new Uint8Array(0);
+    if (body !== undefined) bytes = body instanceof Uint8Array ? body : utf8.encode(typeof body === 'string' ? body : JSON.stringify(body));
+    const signed = method + '\n' + path + '\n' + ts + '\n' + nonce + '\n' + SESSION + '\n' + hex(sha256(bytes));
+    const headers = { 'X-Bridge-Ts': ts, 'X-Bridge-Nonce': nonce, 'X-Bridge-Session': SESSION, 'X-Bridge-Auth': hex(hmacSha256(key, utf8.encode(signed))) };
+    if (body !== undefined) headers['Content-Type'] = 'application/json';
+    ctrl = ctrl || new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs || 30000);
+    try {
+      const res = await fetch(RELAY + path, { method, headers, body: body !== undefined ? bytes : undefined, signal: ctrl.signal });
+      const resBytes = new Uint8Array(await res.arrayBuffer());
+      const sig = res.headers.get('X-Bridge-Sig') || '';
+      const want = hex(hmacSha256(key, concatBytes(utf8.encode('resp\n' + nonce + '\n' + res.status + '\n'), resBytes)));
+      let json = null;
+      if (resBytes.length) { try { json = JSON.parse(new TextDecoder().decode(resBytes)); } catch (e) { json = null; } }
+      return { status: res.status, verified: sig === want, json };
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  function askFileInfo() {
+    return new Promise(resolve => { pending.set('__info', resolve); parent.postMessage({ pluginMessage: { type: 'file-info' } }, '*'); });
+  }
+
+  // The main thread bounds each job by its deadline; this is a second guard so the poll loop never hangs.
+  function runInFigma(job) {
+    const limit = (Number(job.timeoutMs) > 0 ? Number(job.timeoutMs) : 60000) + 15000;
+    mainBusy++;
+    return new Promise(resolve => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        resolve({ ok: false, ms: limit, error: 'No answer from the plugin main thread within ' + limit + ' ms.', logs: [] });
+      }, limit);
+      pending.set(job.id, out => {          // the main thread's answer (may arrive after the guard fired)
+        mainBusy--;
+        clearTimeout(timer);
+        if (!settled) { settled = true; resolve(out); }
+      });
+      parent.postMessage({ pluginMessage: { type: 'job', job } }, '*');
+    });
+  }
+
+  async function sendResult(id, out) {
+    let bytes = utf8.encode(JSON.stringify({ id, ok: !!out.ok, result: out.result ?? null, error: out.error ?? null, logs: out.logs || [] }));
+    const tooBig = n => utf8.encode(JSON.stringify({ id, ok: false, result: null, logs: [], error: 'The result is too large to send (' + Math.round(n / 1e6) + ' MB); return less data, or lower scale / maxDimension.' }));
+    if (bytes.length > MAX_BODY_BYTES) bytes = tooBig(bytes.length);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let r = null;
+      try { r = await call('POST', '/result', bytes, 120000); } catch (e) { r = null; }
+      if (r && r.status === 204 && r.verified) return;
+      bytes = r && r.status === 413 ? tooBig(bytes.length)
+        : utf8.encode(JSON.stringify({ id, ok: false, result: null, logs: [], error: 'The relay could not accept the result' + (r ? ' (HTTP ' + r.status + ').' : ' (network error).') }));
+    }
+  }
+
+  async function handle(job, stale) {
+    if (stale && paused) {                  // dispatched while Pause was clicked: refuse it, do not run it
+      await sendResult(job.id, { ok: false, error: 'The Figma Bridge plugin was paused before this job ran; it did not run.' });
+      return;
+    }
+    setState('wait', 'Running ' + job.type + '…');
+    const out = await runInFigma(job);
+    jobs++; if (!out.ok) failures++; counts();
+    log(job.type + (out.ok ? ' ok' : ' failed') + ' (' + out.ms + ' ms)' + (out.ok ? '' : ': ' + String(out.error).split('\n')[0]), out.ok ? '' : 'bad');
+    await sendResult(job.id, out);
+    if (!paused) setState('on', 'Connected');
+  }
+
+  async function loop(gen) {
+    let backoff = 500, announced = false;
+    while (gen === generation && !paused) {
+      try {
+        while (mainBusy > 0 && gen === generation) await sleep(200);   // never queue a job behind a stuck one
+        if (gen !== generation) return;
+        if (!announced) {
+          const r = await call('POST', '/hello', await askFileInfo(), 5000);
+          if (r.status === 401) { setState('err', 'Wrong token'); log('relay rejected the token', 'bad'); return; }
+          if (!r.verified) throw new Error('untrusted');
+          announced = true;
+          setState('on', 'Connected');
+          log('connected to ' + RELAY, 'ok');
+        }
+        const r = await call('GET', '/next', undefined, 30000);
+        if (r.status === 401) { if (gen === generation) { setState('err', 'Wrong token'); log('relay rejected the token', 'bad'); } return; }
+        if (!r.verified) throw new Error('untrusted');
+        if (r.status === 200 && r.json && r.json.id) {
+          const stale = gen !== generation;
+          await handle(r.json, stale);
+          if (stale) return;
+          continue;
+        }
+        if (gen !== generation) return;
+        backoff = 500;
+        if (r.status === 204) continue;
+        if (r.status === 410) { announced = false; continue; }          // new relay: say hello again
+        if (r.status === 409) {
+          setState('err', 'Another Figma file has the bridge. Click Connect to take it back.');
+          log('another file took over', 'bad');
+          return;
+        }
+        throw new Error('next ' + r.status);
+      } catch (err) {
+        if (gen !== generation || paused) return;
+        const untrusted = err && err.message === 'untrusted';
+        if (announced || untrusted) log(untrusted ? 'something else answered on ' + RELAY + '; not trusted' : 'relay unreachable, retrying', 'bad');
+        announced = false;
+        setState('wait', untrusted ? 'Port taken by another program (not the relay)' : 'Waiting for the relay (start your agent or run figma-bridge serve)');
+        await sleep(backoff);
+        backoff = Math.min(backoff * 2, 3000);
+      }
+    }
+  }
+
+  function start() {
+    token = $('token').value.trim();
+    if (!token) { setState('err', 'Paste the token first'); return; }
+    parent.postMessage({ pluginMessage: { type: 'save-token', token } }, '*');
+    paused = false;
+    $('toggle').textContent = 'Pause';
+    generation++;                           // an old loop finishes its current request, handles any job, then stops
+    loop(generation);
+  }
+
+  function pause() {
+    paused = true;
+    generation++;
+    $('toggle').textContent = 'Resume';
+    setState('', 'Paused');
+    // /bye releases the held poll on the relay; an already-dispatched job is answered "paused, did not run".
+    call('POST', '/bye', {}, 3000, new AbortController()).catch(() => {});
+  }
+
+  $('connect').onclick = start;
+  $('token').addEventListener('keydown', e => { if (e.key === 'Enter') start(); });
+  $('toggle').onclick = () => (paused ? start() : pause());
+  $('relay').textContent = RELAY;
+
+  window.onmessage = event => {
+    const msg = event.data && event.data.pluginMessage;
+    if (!msg) return;
+    if (msg.type === 'init') {
+      $('token').value = msg.token || '';
+      if (msg.token) start(); else setState('err', 'Paste the token to connect');
+    } else if (msg.type === 'file-info') {
+      const r = pending.get('__info'); pending.delete('__info'); if (r) r(msg.info);
+    } else if (msg.type === 'job-result') {
+      const r = pending.get(msg.id); pending.delete(msg.id); if (r) r(msg);
+    }
+  };
+</script>
+</body>
+</html>

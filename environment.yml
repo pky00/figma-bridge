@@ -1,0 +1,14 @@
+name: figma-bridge
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - fastapi>=0.115
+  - starlette>=0.51
+  - uvicorn>=0.30
+  - httpx>=0.27
+  - pytest>=8
+  - pip:
+      - mcp>=2,<3
+      - -e .
